@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { PLAN_INFO } from './data'
-import { addAccount, advanceTime, cancelSubscription, changeEnvironment, changePlan, createAccount, emptyStore, injectEvent, messageCost, replaceAccount, riskScore, sendMessage, submitAppeal, updateRiskWeight } from './engine'
+import { HOUR, PLAN_INFO } from './data'
+import { addAccount, advanceTime, cancelSubscription, changeEnvironment, changeMode, changePlan, createAccount, createChat, emptyStore, injectEvent, messageCost, refundLatestInvoice, replaceAccount, riskScore, sendMessage, submitAppeal, updateRiskWeight } from './engine'
 import { loadStore, saveStore } from './persistence'
 import type { Account, SignupOptions } from './types'
 
@@ -28,6 +28,19 @@ describe('risk engine', () => {
       return { score: riskScore(a), status: a.status, rng: a.rng, events: a.riskEvents.map(e => e.weight) }
     }
     expect(run()).toEqual(run())
+  })
+
+  it('does not consume risk randomness to number ordinary records', () => {
+    const a = account()
+    expect(createChat(a).rng).toBe(a.rng)
+  })
+
+  it('runs delayed checks at their scheduled time during a long jump', () => {
+    const changed = changeEnvironment(account(), { region: '欧洲', network: '数据中心网络', concurrentSessions: 4 })
+    const dueAt = changed.pendingChecks![0].dueAt
+    const later = advanceTime(changed, 24)
+    expect(later.pendingChecks?.[0].completedAt).toBe(dueAt)
+    expect(later.pendingChecks?.[0].status).toBe('completed')
   })
 
   it('transitions through escalating responses based on accumulated evidence', () => {
@@ -73,11 +86,38 @@ describe('risk engine', () => {
     expect(ended.cancelAt).toBeUndefined()
   })
 
+  it('does not force a renewal failure when the internal ledger runs out', () => {
+    const pro = changePlan(account(), 'pro')
+    pro.balance = 0
+    const renewed = advanceTime(pro, 30 * 24)
+    expect(renewed.invoices).toHaveLength(2)
+    expect(renewed.invoices[0].result).toBe('paid')
+    expect(renewed.plan).toBe('pro')
+  })
+
+  it('allows a single timely virtual refund and changes the plan', () => {
+    const pro = changePlan(account(), 'pro')
+    const refunded = refundLatestInvoice(pro)
+    expect(refunded.plan).toBe('free')
+    expect(refunded.invoices[0].result).toBe('refund')
+    expect(refunded.invoices[0].refundOf).toBe(pro.invoices[0].id)
+    expect(refunded.balance).toBe(pro.balance + PLAN_INFO.pro.price)
+    expect(() => refundLatestInvoice(refunded)).toThrow()
+    expect(() => refundLatestInvoice(advanceTime(pro, 8 * 24))).toThrow()
+  })
+
   it('applies laboratory event multipliers to actual risk', () => {
     const base = injectEvent(account(), 'automation')
     const tuned = updateRiskWeight(base, 'automation', 2)
     expect(riskScore(tuned)).toBeGreaterThan(riskScore(base))
     expect(tuned.riskHistory.at(-1)?.score).toBe(riskScore(tuned))
+    expect(riskScore(updateRiskWeight(base, 'automation', 0))).toBeLessThan(riskScore(base))
+  })
+
+  it('uses the selected difficulty in the same risk engine', () => {
+    const a = injectEvent(account(), 'automation')
+    expect(riskScore(changeMode(a, 'hard'))).toBeGreaterThan(riskScore(a))
+    expect(changeMode(a, 'chaos').mode).toBe('chaos')
   })
 })
 
@@ -93,9 +133,11 @@ describe('appeals and persistence', () => {
     expect(['review', 'frozen', 'banned']).toContain(a.status)
     a = submitAppeal(a, '我在今天切换了虚拟网络与设备，愿意提供具体使用时间供复核。')
     expect(a.appeals[0].stage).toBe('pending')
+    const dueAt = a.appeals[0].dueAt
     a = advanceTime(a, 49)
     expect(['granted', 'denied', 'needs_info']).toContain(a.appeals[0].stage)
     expect(a.timeline.some(e => e.category === 'appeal')).toBe(true)
+    expect(a.timeline.find(e => e.title === '申诉复核结果')?.at).toBe(dueAt)
   })
 
   it('can grant or deny appeals under different reproducible seeds', () => {
@@ -133,6 +175,31 @@ describe('appeals and persistence', () => {
     expect(loadStore(adapter)).toEqual(store)
     storage.set('account-weather-save-v1', '{bad')
     expect(loadStore(adapter).accounts).toEqual([])
+  })
+
+  it('advances virtual time after reopening a saved browser session', () => {
+    const storage = new Map<string, string>()
+    const adapter = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => { storage.set(key, value) } }
+    const original = account()
+    saveStore(addAccount(emptyStore(), original), adapter, 1_000_000_000_000)
+    const reopened = loadStore(adapter, 1_000_000_000_000 + 6 * 3600_000)
+    expect(reopened.accounts[0].now).toBe(original.now + 6 * 3600_000)
+    expect(reopened.accounts[0].sessionResetAt).toBeGreaterThan(reopened.accounts[0].now)
+  })
+
+  it('saves the real-time checkpoint atomically with the account archive', () => {
+    const storage = new Map<string, string>()
+    const writes: string[] = []
+    const adapter = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { writes.push(key); if (key === 'account-weather-wall-clock-v1') throw new Error('second write failed'); storage.set(key, value) },
+    }
+    const original = addAccount(emptyStore(), account())
+    const savedAt = 1_000_000_000_000
+    saveStore(original, adapter, savedAt)
+    expect(writes).toEqual(['account-weather-save-v1'])
+    expect(JSON.parse(storage.get('account-weather-save-v1')!).savedAtWall).toBe(savedAt)
+    expect(loadStore(adapter, savedAt + HOUR).accounts[0].now).toBe(original.accounts[0].now + HOUR)
   })
 
   it('migrates an existing paid save to a billing schedule', () => {
